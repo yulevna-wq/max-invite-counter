@@ -1,117 +1,209 @@
 import os
+import sys
 import time
 import sqlite3
+from pathlib import Path
+
 import requests
 
-TOKEN = os.getenv("MAX_TOKEN")
-BASE = "https://platform-api2.max.ru"
-HEADERS = {"Authorization": TOKEN}
+BASE_URL = "https://platform-api2.max.ru"
+TOKEN = os.getenv("MAX_TOKEN", "").strip()
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "stats.db"
 
-db = sqlite3.connect("stats.db", check_same_thread=False)
+if not TOKEN:
+    print("ОШИБКА: не задана переменная окружения MAX_TOKEN", flush=True)
+    sys.exit(1)
+
+HEADERS = {"Authorization": TOKEN, "Content-Type": "application/json"}
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+# Перенос старой базы, если она лежала рядом с main.py.
+old_db = Path.cwd() / "stats.db"
+if old_db.exists() and old_db.resolve() != DB_PATH.resolve() and not DB_PATH.exists():
+    try:
+        import shutil
+        shutil.copy2(old_db, DB_PATH)
+        print(f"Старая база перенесена в {DB_PATH}", flush=True)
+    except Exception as exc:
+        print(f"Не удалось перенести старую базу: {exc}", flush=True)
+
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute("""
 CREATE TABLE IF NOT EXISTS additions (
-    chat_id TEXT,
-    new_user_id TEXT,
-    inviter_id TEXT,
-    PRIMARY KEY(chat_id, new_user_id)
+    chat_id TEXT NOT NULL,
+    new_user_id TEXT NOT NULL,
+    inviter_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (chat_id, new_user_id)
 )
 """)
 db.commit()
 
-marker = None
 
-def send(chat_id, text):
-    requests.post(
-        f"{BASE}/messages",
-        headers=HEADERS,
-        params={"chat_id": chat_id},
-        json={"text": text},
-        timeout=20
+def api_request(method, path, **kwargs):
+    response = SESSION.request(
+        method,
+        f"{BASE_URL}{path}",
+        timeout=kwargs.pop("timeout", 40),
+        **kwargs,
     )
+    response.raise_for_status()
+    data = response.json() if response.content else {}
+    if isinstance(data, dict) and data.get("success") is False:
+        raise RuntimeError(f"MAX API: {data.get('code', 'error')}: {data.get('message', '')}")
+    return data
+
+
+def send(chat_id, message_text):
+    if not chat_id:
+        return
+    api_request(
+        "POST",
+        "/messages",
+        params={"chat_id": chat_id},
+        json={"text": message_text[:4000]},
+    )
+
+
+def command_name(raw_text):
+    if not raw_text:
+        return ""
+    first = raw_text.strip().split()[0]
+    return first.split("@", 1)[0].lower()
+
 
 def handle(update):
     event = update.get("update_type")
 
-    # Подсчет добавленных участников
+    # MAX сообщает inviter_id=null, когда человек вошёл по ссылке.
+    # Такие вступления намеренно не учитываем.
     if event == "user_added":
-        inviter = update.get("inviter_id")
-        new_user = update.get("user", {}).get("user_id")
+        inviter_id = update.get("inviter_id")
+        new_user_id = (update.get("user") or {}).get("user_id")
         chat_id = update.get("chat_id")
 
-        if inviter and new_user and chat_id and not update.get("is_channel"):
-            try:
-                db.execute(
-                    "INSERT INTO additions VALUES (?, ?, ?)",
-                    (str(chat_id), str(new_user), str(inviter))
-                )
-                db.commit()
-                print("Засчитано добавление:", inviter)
-            except sqlite3.IntegrityError:
-                pass
+        if inviter_id is not None and new_user_id is not None and chat_id is not None:
+            if not update.get("is_channel", False):
+                try:
+                    cursor = db.execute(
+                        "INSERT OR IGNORE INTO additions "
+                        "(chat_id, new_user_id, inviter_id) VALUES (?, ?, ?)",
+                        (str(chat_id), str(new_user_id), str(inviter_id)),
+                    )
+                    db.commit()
+                    if cursor.rowcount == 1:
+                        print(f"Засчитано добавление: inviter_id={inviter_id}", flush=True)
+                except sqlite3.Error as exc:
+                    print(f"Ошибка записи в SQLite: {exc}", flush=True)
+        return
 
-    # Команды
-    if event == "message_created":
-        msg = update.get("message", {})
-        text = (msg.get("body", {}).get("text") or "").strip()
-        chat_id = msg.get("recipient", {}).get("chat_id")
-        sender = msg.get("sender", {}).get("user_id")
+    if event != "message_created":
+        return
 
-        if not chat_id or not sender:
+    message = update.get("message") or {}
+    body = message.get("body") or {}
+    text = (body.get("text") or "").strip()
+    recipient = message.get("recipient") or {}
+    chat_id = recipient.get("chat_id") or update.get("chat_id")
+    sender = message.get("sender") or {}
+    sender_id = sender.get("user_id")
+
+    if not chat_id or sender_id is None:
+        return
+
+    cmd = command_name(text)
+
+    if cmd in ("/top", "/топ"):
+        rows = db.execute("""
+            SELECT inviter_id, COUNT(*) AS total
+            FROM additions
+            WHERE chat_id = ?
+            GROUP BY inviter_id
+            ORDER BY total DESC, inviter_id ASC
+            LIMIT 10
+        """, (str(chat_id),)).fetchall()
+
+        if not rows:
+            send(chat_id, "🏆 Пока нет засчитанных приглашений.\n"
+                          "Учитываются только участники, добавленные напрямую.")
             return
 
-        if text.startswith("/top"):
-            rows = db.execute("""
-                SELECT inviter_id, COUNT(*)
-                FROM additions
-                WHERE chat_id=?
-                GROUP BY inviter_id
-                ORDER BY COUNT(*) DESC
-                LIMIT 10
-            """, (str(chat_id),)).fetchall()
+        result = ["🏆 Рейтинг участников по личным добавлениям:", ""]
+        for index, (user_id, total) in enumerate(rows, 1):
+            result.append(f"{index}. ID {user_id} — {total}")
+        send(chat_id, "\n".join(result))
+        return
 
-            if not rows:
-                send(chat_id, "Пока никто не добавил участников.")
-                return
+    if cmd in ("/my", "/моястатистика"):
+        count = db.execute("""
+            SELECT COUNT(*)
+            FROM additions
+            WHERE chat_id = ? AND inviter_id = ?
+        """, (str(chat_id), str(sender_id))).fetchone()[0]
+        send(chat_id, f"👥 Ты лично добавил(а): {count}")
+        return
 
-            result = "🏆 Рейтинг добавивших:\n\n"
-            for i, (user, count) in enumerate(rows, 1):
-                result += f"{i}. ID {user} — {count}\n"
-            send(chat_id, result)
+    if cmd in ("/help", "/помощь"):
+        send(chat_id, "Команды бота:\n"
+                      "/my — твои личные приглашения\n"
+                      "/top — рейтинг участников\n\n"
+                      "В зачёт идут только прямые добавления. "
+                      "Вступления по ссылке не учитываются.")
+        return
 
-        elif text.startswith("/my"):
-            count = db.execute("""
-                SELECT COUNT(*) FROM additions
-                WHERE chat_id=? AND inviter_id=?
-            """, (str(chat_id), str(sender))).fetchone()[0]
-
-            send(chat_id, f"👥 Ты добавил: {count}")
 
 def run():
-    global marker
+    marker = None
+    print(f"Бот запускается. База данных: {DB_PATH}", flush=True)
+
+    # Проверяем токен и TLS до запуска цикла обновлений.
+    me = api_request("GET", "/me")
+    print(f"MAX API подключён: {me.get('first_name', 'бот')}", flush=True)
 
     while True:
         try:
-            params = {"timeout": 30}
+            params = {
+                "timeout": 30,
+                "types": ["message_created", "user_added"],
+            }
             if marker is not None:
                 params["marker"] = marker
 
-            response = requests.get(
-                f"{BASE}/updates",
-                headers=HEADERS,
+            data = api_request(
+                "GET",
+                "/updates",
                 params=params,
-                timeout=40
+                timeout=40,
             )
-            response.raise_for_status()
-            data = response.json()
 
             for update in data.get("updates", []):
-                handle(update)
+                try:
+                    handle(update)
+                except Exception as exc:
+                    print(f"Ошибка обработки события: {exc}", flush=True)
 
             marker = data.get("marker", marker)
 
-        except Exception as e:
-            print("Ошибка:", e)
+        except requests.exceptions.SSLError as exc:
+            print(
+                "SSL-ОШИБКА: проверьте Russian Trusted Root CA и "
+                f"REQUESTS_CA_BUNDLE. Подробности: {exc}",
+                flush=True,
+            )
+            time.sleep(10)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "?"
+            print(f"HTTP-ошибка MAX API ({status}): {exc}", flush=True)
+            if status == 401:
+                print("Проверьте переменную MAX_TOKEN в настройках Bothost.", flush=True)
+            time.sleep(10)
+        except Exception as exc:
+            print(f"Ошибка цикла обновлений: {exc}", flush=True)
             time.sleep(5)
+
 
 if __name__ == "__main__":
     run()
