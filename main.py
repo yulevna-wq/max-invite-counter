@@ -9,7 +9,7 @@
 
 Хранение: /app/data/stats.db (на Bothost переживает обновления из Git).
 Запуск:  MAX_TOKEN=<токен> python main.py
-Рядом с файлом должен лежать russian_trusted_root_ca_pem.crt (корень Минцифры).
+Рядом с файлом: russian_trusted_root_ca_pem.crt (корень Минцифры).
 """
 
 import os
@@ -29,7 +29,7 @@ TOKEN = os.getenv("MAX_TOKEN", "").strip()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 DB_PATH = DATA_DIR / "stats.db"
 
-# Корневой сертификат Минцифры (промежуточный сервер присылает сам, он не нужен).
+# Корневой сертификат Минцифры (промежуточный сервер присылает сам).
 HERE = Path(__file__).resolve().parent
 ROOT_CERT = HERE / "russian_trusted_root_ca_pem.crt"
 # Бандл собираем во временном каталоге: /app/data переживает деплои,
@@ -40,6 +40,12 @@ POLL_TIMEOUT = 30          # секунды, допустимо 0..90
 HTTP_TIMEOUT = 40          # должен быть больше POLL_TIMEOUT
 POLL_PAUSE = 0.4           # минимум 300 мс между запросами /updates
 UPDATE_TYPES = "message_created,user_added"
+
+BOT_COMMANDS = [
+    {"name": "top", "description": "Рейтинг участников по добавлениям"},
+    {"name": "my", "description": "Сколько участников добавил лично ты"},
+    {"name": "help", "description": "Как считается статистика"},
+]
 
 
 if not TOKEN:
@@ -104,7 +110,7 @@ def api_request(method, path, **kwargs):
         **kwargs,
     )
 
-    # Тело ошибки MAX важнее голого статус-кода: chat.denied, add.participant.privacy и т.д.
+    # Тело ошибки MAX важнее статус-кода: chat.denied, add.participant.privacy и т.д.
     if response.status_code >= 400:
         print(f"MAX API {response.status_code}: {response.text[:500]}", flush=True)
 
@@ -127,6 +133,15 @@ def send(chat_id, message_text):
         params={"chat_id": chat_id},
         json={"text": message_text[:4000]},
     )
+
+
+def setup_commands():
+    """Подсказки команд в интерфейсе MAX. Не критично, если не получится."""
+    try:
+        api_request("PATCH", "/me/commands", json={"commands": BOT_COMMANDS})
+        print("Команды зарегистрированы: /top, /my, /help", flush=True)
+    except Exception as exc:
+        print(f"Не удалось зарегистрировать команды (не критично): {exc}", flush=True)
 
 
 def remember(user):
@@ -184,7 +199,7 @@ def command_name(raw_text):
 def handle(update):
     event = update.get("update_type")
 
-    # --- Зачёт добавлений -------------------------------------------------
+    # --- Зачёт добавлений ---
     if event == "user_added":
         chat_id = update.get("chat_id")
         new_user = update.get("user") or {}
@@ -223,7 +238,7 @@ def handle(update):
             )
         return
 
-    # --- Команды ----------------------------------------------------------
+    # --- Команды ---
     if event != "message_created":
         return
 
@@ -265,7 +280,6 @@ def handle(update):
             )
             return
 
-        # если кого-то нет в кэше имён — пробуем добрать один раз
         unknown = any(
             db.execute("SELECT 1 FROM names WHERE user_id = ?", (r[0],)).fetchone() is None
             for r in rows
@@ -306,6 +320,7 @@ def run():
     print(f"Бот запускается. База данных: {DB_PATH}", flush=True)
     me = api_request("GET", "/me")
     print(f"MAX API подключён: {me.get('first_name', 'бот')}", flush=True)
+    setup_commands()
 
     while True:
         try:
@@ -320,7 +335,6 @@ def run():
             data = api_request("GET", "/updates", params=params, timeout=HTTP_TIMEOUT)
 
             for update in data.get("updates", []):
-                # без дампа персональных данных в логи
                 print(
                     f"Событие: {update.get('update_type')} chat={update.get('chat_id')}",
                     flush=True,
