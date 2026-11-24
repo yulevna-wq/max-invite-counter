@@ -221,7 +221,7 @@ def handle(update):
         ]
 
         for index, (user_id, total) in enumerate(rows, 1):
-            result.append(f"{index}. ID {user_id} — {total}")
+                    result.append(f"{index}. ID {user_id} — {total}")
 
         send(chat_id, "\n".join(result))
         return
