@@ -9,7 +9,7 @@ import certifi
 import requests
 
 BASE_URL = "https://platform-api2.max.ru"
-TOKEN = os.getenv("MAX_TOKEN", "").strip()
+TOKEN = os.getenv("MAX_TOKEN", "").strip() 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "stats.db"
