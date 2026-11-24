@@ -212,7 +212,8 @@ def run():
             params = {
                 "timeout": 30,
                 # MAX API ожидает список types в формате через запятую.
-                "types": "message_created,user_added",
+                
+            "types": "message_created,user_added",
             }
             if marker is not None:
                 params["marker"] = marker
@@ -225,19 +226,22 @@ def run():
             )
 
             for update in data.get("updates", []):
-    print(f"ПОЛУЧЕНО СОБЫТИЕ: {update}", flush=True)
-    try:
-        handle(update)
-    except Exception as exc:
-        print(f"Ошибка обработки события: {exc}", flush=True)
+                print(f"ПОЛУЧЕНО СОБЫТИЕ: {update}", flush=True)
+                try:
+                    handle(update)
+                except Exception as exc:
+                    print(f"Ошибка обработки события: {exc}", flush=True)
+
             marker = data.get("marker", marker)
 
         except requests.exceptions.SSLError as exc:
             print(f"SSL-ОШИБКА: {exc}", flush=True)
             time.sleep(10)
+
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else "?"
             print(f"HTTP-ошибка MAX API ({status}): {exc}", flush=True)
+
             if status == 401:
                 print(
                     "Проверьте переменную MAX_TOKEN в настройках Bothost.",
