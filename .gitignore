@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+stats.db
+stats.db-wal
+stats.db-shm
+data/
+max-ca-bundle.pem
