@@ -20,6 +20,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY russian_trusted_root_ca_pem.crt .
+COPY russian_trusted_sub_ca_pem.crt . 
 
 RUN mkdir -p /app/data
 
