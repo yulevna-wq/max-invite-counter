@@ -1,3 +1,0 @@
-Перед Docker-сборкой скачайте официальный Russian Trusted Root CA:
-https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt
-и положите файл рядом с Dockerfile под именем russian_trusted_root_ca_pem.crt.
