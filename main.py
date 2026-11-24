@@ -1,15 +1,11 @@
 """
 Счётчик приглашений для мессенджера MAX (long polling).
 
-Правила зачёта:
-  +1 — тому, кто ДОБАВИЛ участника (user_added с inviter_id);
-   0 — вошедший по ссылке (inviter_id = null);
-   0 — боты, самодобавление, каналы;
-   0 — повторный вход уже засчитанного человека.
-
-Хранение: /app/data/stats.db (на Bothost переживает обновления из Git).
-Запуск:  MAX_TOKEN=<токен> python main.py
-Рядом с файлом: russian_trusted_root_ca_pem.crt (корень Минцифры).
+Правила:
+  +1 — пригласившему, если он добавил человека напрямую;
+   0 — вошедший по ссылке, боты, самодобавление, каналы;
+   0 — повторный вход уже засчитанного;
+  −1 — пригласившему, если приглашённый вышел из группы.
 """
 
 import os
@@ -25,21 +21,17 @@ import requests
 BASE_URL = "https://platform-api2.max.ru"
 TOKEN = os.getenv("MAX_TOKEN", "").strip()
 
-# Персистентные данные — только здесь.
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 DB_PATH = DATA_DIR / "stats.db"
 
-# Корневой сертификат Минцифры (промежуточный сервер присылает сам).
 HERE = Path(__file__).resolve().parent
 ROOT_CERT = HERE / "russian_trusted_root_ca_pem.crt"
-# Бандл собираем во временном каталоге: /app/data переживает деплои,
-# и там навсегда осталась бы устаревшая копия certifi.
 CA_BUNDLE = Path(os.getenv("TMPDIR", "/tmp")) / "max-ca-bundle.pem"
 
-POLL_TIMEOUT = 30          # секунды, допустимо 0..90
-HTTP_TIMEOUT = 40          # должен быть больше POLL_TIMEOUT
-POLL_PAUSE = 0.4           # минимум 300 мс между запросами /updates
-UPDATE_TYPES = "message_created,user_added"
+POLL_TIMEOUT = 30
+HTTP_TIMEOUT = 40
+POLL_PAUSE = 0.4
+UPDATE_TYPES = "message_created,user_added,user_removed"
 
 BOT_COMMANDS = [
     {"name": "top", "description": "Рейтинг участников по добавлениям"},
@@ -73,7 +65,6 @@ SESSION.headers.update(HEADERS)
 SESSION.verify = str(CA_BUNDLE)
 print("SSL: корневой сертификат Минцифры подключён.", flush=True)
 
-# Перенос старой базы, если она лежала рядом с main.py.
 old_db = Path.cwd() / "stats.db"
 if old_db.exists() and old_db.resolve() != DB_PATH.resolve() and not DB_PATH.exists():
     try:
@@ -96,8 +87,17 @@ db.execute(
     )
     """
 )
+db.execute("CREATE TABLE IF NOT EXISTS names (user_id TEXT PRIMARY KEY, name TEXT NOT NULL)")
 db.execute(
-    "CREATE TABLE IF NOT EXISTS names (user_id TEXT PRIMARY KEY, name TEXT NOT NULL)"
+    """
+    CREATE TABLE IF NOT EXISTS departures (
+        chat_id TEXT NOT NULL,
+        new_user_id TEXT NOT NULL,
+        inviter_id TEXT NOT NULL,
+        admin_id TEXT,
+        left_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    )
+    """
 )
 db.commit()
 
@@ -109,13 +109,9 @@ def api_request(method, path, **kwargs):
         timeout=kwargs.pop("timeout", HTTP_TIMEOUT),
         **kwargs,
     )
-
-    # Тело ошибки MAX важнее статус-кода: chat.denied, add.participant.privacy и т.д.
     if response.status_code >= 400:
         print(f"MAX API {response.status_code}: {response.text[:500]}", flush=True)
-
     response.raise_for_status()
-
     data = response.json() if response.content else {}
     if isinstance(data, dict) and data.get("success") is False:
         raise RuntimeError(
@@ -136,7 +132,6 @@ def send(chat_id, message_text):
 
 
 def setup_commands():
-    """Подсказки команд в интерфейсе MAX. Не критично, если не получится."""
     try:
         api_request("PATCH", "/me/commands", json={"commands": BOT_COMMANDS})
         print("Команды зарегистрированы: /top, /my, /help", flush=True)
@@ -145,7 +140,6 @@ def setup_commands():
 
 
 def remember(user):
-    """Кэшируем имя, чтобы в рейтинге были люди, а не ID."""
     if not user:
         return
     user_id = user.get("user_id")
@@ -172,7 +166,6 @@ def display_name(user_id):
 
 
 def refresh_names(chat_id, limit_pages=5):
-    """Добираем имена тех, кто ещё ничего не писал. Бот должен быть админом."""
     marker = None
     try:
         for _ in range(limit_pages):
@@ -209,12 +202,12 @@ def handle(update):
         remember(new_user)
 
         if (
-            inviter_id is None                      # зашёл по ссылке — не считаем
+            inviter_id is None
             or new_user_id is None
             or chat_id is None
-            or update.get("is_channel", False)      # каналы не считаем
-            or new_user.get("is_bot", False)        # ботов не считаем
-            or str(inviter_id) == str(new_user_id)  # сам себя не считаем
+            or update.get("is_channel", False)
+            or new_user.get("is_bot", False)
+            or str(inviter_id) == str(new_user_id)
         ):
             return
 
@@ -236,6 +229,50 @@ def handle(update):
                 f"Засчитано добавление: chat={chat_id} inviter={inviter_id}",
                 flush=True,
             )
+        return
+
+    # --- Снятие балла, если приглашённый вышел ---
+    if event == "user_removed":
+        chat_id = update.get("chat_id")
+        left_user = update.get("user") or {}
+        left_id = left_user.get("user_id")
+
+        if chat_id is None or left_id is None or update.get("is_channel", False):
+            return
+
+        row = db.execute(
+            "SELECT inviter_id FROM additions WHERE chat_id = ? AND new_user_id = ?",
+            (str(chat_id), str(left_id)),
+        ).fetchone()
+
+        if not row:
+            return  # человек пришёл по ссылке — снимать нечего
+
+        inviter_id = row[0]
+        admin_id = update.get("admin_id")  # None = вышел сам
+
+        try:
+            db.execute(
+                """
+                INSERT INTO departures (chat_id, new_user_id, inviter_id, admin_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (str(chat_id), str(left_id), inviter_id,
+                 str(admin_id) if admin_id is not None else None),
+            )
+            db.execute(
+                "DELETE FROM additions WHERE chat_id = ? AND new_user_id = ?",
+                (str(chat_id), str(left_id)),
+            )
+            db.commit()
+        except sqlite3.Error as exc:
+            print(f"Ошибка снятия балла: {exc}", flush=True)
+            return
+
+        print(
+            f"Снят балл: chat={chat_id} inviter={inviter_id}",
+            flush=True,
+        )
         return
 
     # --- Команды ---
@@ -308,7 +345,8 @@ def handle(update):
             "/my — твои личные приглашения\n"
             "/top — рейтинг участников\n\n"
             "В зачёт идут только прямые добавления. "
-            "Вступления по ссылке не учитываются.",
+            "Вступления по ссылке не учитываются. "
+            "Если приглашённый выходит из группы — балл снимается.",
         )
         return
 
@@ -344,7 +382,6 @@ def run():
                 except Exception as exc:
                     print(f"Ошибка обработки события: {exc}", flush=True)
 
-            # ВАЖНО: при marker=null позиция не теряется
             marker = data.get("marker") or marker
             errors = 0
             time.sleep(POLL_PAUSE)
@@ -356,12 +393,10 @@ def run():
         except requests.exceptions.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else 0
             print(f"HTTP-ошибка MAX API ({status}): {exc}", flush=True)
-
             if status == 401:
                 print("Проверьте переменную MAX_TOKEN в настройках Bothost.", flush=True)
             if status == 400:
-                marker = None  # протухший указатель — начинаем заново
-
+                marker = None
             errors += 1
             time.sleep(min(60, 5 * (2 ** min(errors, 4))))
 
