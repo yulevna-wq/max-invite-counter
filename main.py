@@ -15,38 +15,41 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "stats.db"
 
 # Корневой сертификат Минцифры должен лежать рядом с main.py.
-CERT_FILE = Path(__file__).resolve().parent / "russian_trusted_root_ca_pem.crt"
+
+ROOT_CERT = Path(__file__).resolve().parent / "russian_trusted_root_ca_pem.crt"
+SUB_CERT = Path(__file__).resolve().parent / "russian_trusted_sub_ca_pem.crt"
 CA_BUNDLE = DATA_DIR / "max-ca-bundle.pem"
 
 if not TOKEN:
     print("ОШИБКА: не задана переменная окружения MAX_TOKEN", flush=True)
     sys.exit(1)
 
-if not CERT_FILE.is_file():
-    print(
-        f"ОШИБКА: не найден сертификат {CERT_FILE}. "
-        "Положите russian_trusted_root_ca_pem.crt рядом с main.py.",
-        flush=True,
-    )
+if not ROOT_CERT.is_file():
+    print("ОШИБКА: не найден корневой сертификат!", flush=True)
     sys.exit(1)
 
-# Сохраняем стандартные доверенные CA Requests и добавляем сертификат Минцифры.
+if not SUB_CERT.is_file():
+    print("ОШИБКА: не найден промежуточный сертификат!", flush=True)
+    sys.exit(1)
+
 try:
     shutil.copyfile(certifi.where(), CA_BUNDLE)
-    with CA_BUNDLE.open("ab") as bundle, CERT_FILE.open("rb") as cert:
+    with CA_BUNDLE.open("ab") as bundle:
         bundle.write(b"\n")
-        bundle.write(cert.read())
-        if not CA_BUNDLE.read_bytes().endswith(b"\n"):
-            bundle.write(b"\n")
+        bundle.write(ROOT_CERT.read_bytes())
+        bundle.write(b"\n")
+        bundle.write(SUB_CERT.read_bytes())
+        bundle.write(b"\n")
 except OSError as exc:
-    print(f"ОШИБКА подготовки SSL-сертификатов: {exc}", flush=True)
+    print(f"ОШИБКА подготовки SSL: {exc}", flush=True)
     sys.exit(1)
 
 HEADERS = {"Authorization": TOKEN, "Content-Type": "application/json"}
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 SESSION.verify = str(CA_BUNDLE)
-print("SSL bundle подготовлен и подключён.", flush=True)
+print("Оба SSL-сертификата подключены.", flush=True)
+
 
 # Перенос старой базы, если она лежала рядом с main.py.
 old_db = Path.cwd() / "stats.db"
