@@ -225,11 +225,11 @@ def run():
             )
 
             for update in data.get("updates", []):
-                try:
-                    handle(update)
-                except Exception as exc:
-                    print(f"Ошибка обработки события: {exc}", flush=True)
-
+    print(f"ПОЛУЧЕНО СОБЫТИЕ: {update}", flush=True)
+    try:
+        handle(update)
+    except Exception as exc:
+        print(f"Ошибка обработки события: {exc}", flush=True)
             marker = data.get("marker", marker)
 
         except requests.exceptions.SSLError as exc:
